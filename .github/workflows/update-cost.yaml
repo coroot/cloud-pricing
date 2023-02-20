@@ -1,0 +1,24 @@
+name: update-cost
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.19.x'
+      - name: Install dependencies
+        run: go get .
+      - name: Run
+        run: go run ./update.go
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+      - name: Copy the dump to the gh-pages branch
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: data
+          target-folder: data
