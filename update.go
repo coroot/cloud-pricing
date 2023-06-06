@@ -25,10 +25,14 @@ const (
 type Region string
 type InstanceType string
 type PurchaseOption string
+type DBDeploymentOption string
+type Engine string
 
 const (
-	OnDemand PurchaseOption = "OnDemand"
-	Spot     PurchaseOption = "Spot"
+	OnDemand PurchaseOption     = "OnDemand"
+	Spot     PurchaseOption     = "Spot"
+	SingleAz DBDeploymentOption = "Single-AZ"
+	MultiAz  DBDeploymentOption = "Multi-AZ"
 )
 
 type InstancePricing struct {
@@ -36,13 +40,22 @@ type InstancePricing struct {
 	Spot     float64 `json:"spot"`
 }
 
+type DBInstancePricing struct {
+	SingleAz *InstancePricing `json:"single_az"`
+	MultiAz  *InstancePricing `json:"multi_az"`
+}
+
 type CloudPricing struct {
-	Compute map[Region]map[InstanceType]*InstancePricing `json:"compute"`
+	Compute      map[Region]map[InstanceType]*InstancePricing              `json:"compute"`
+	ManagedDB    map[Region]map[Engine]map[InstanceType]*DBInstancePricing `json:"managed_db"`
+	ManagedCache map[Region]map[Engine]map[InstanceType]*InstancePricing   `json:"managed_cache"`
 }
 
 func NewCloudPricing() *CloudPricing {
 	return &CloudPricing{
-		Compute: map[Region]map[InstanceType]*InstancePricing{},
+		Compute:      map[Region]map[InstanceType]*InstancePricing{},
+		ManagedDB:    map[Region]map[Engine]map[InstanceType]*DBInstancePricing{},
+		ManagedCache: map[Region]map[Engine]map[InstanceType]*InstancePricing{},
 	}
 }
 
@@ -63,6 +76,52 @@ func (cp *CloudPricing) SetPrice(region Region, instanceType InstanceType, po Pu
 	case Spot:
 		instance.Spot = price
 	}
+}
+
+func (cp *CloudPricing) SetDBPrice(region Region, engine Engine, instanceType InstanceType, do DBDeploymentOption, price float64) {
+	byRegion, ok := cp.ManagedDB[region]
+	if !ok {
+		byRegion = map[Engine]map[InstanceType]*DBInstancePricing{}
+		cp.ManagedDB[region] = byRegion
+	}
+	byEngine := byRegion[engine]
+	if byEngine == nil {
+		byEngine = map[InstanceType]*DBInstancePricing{}
+		byRegion[engine] = map[InstanceType]*DBInstancePricing{}
+	}
+	instance := byEngine[instanceType]
+	if instance == nil {
+		instance = &DBInstancePricing{
+			SingleAz: &InstancePricing{},
+			MultiAz:  &InstancePricing{},
+		}
+		byEngine[instanceType] = instance
+	}
+	switch do {
+	case SingleAz:
+		instance.SingleAz.OnDemand = price
+	case MultiAz:
+		instance.MultiAz.OnDemand = price
+	}
+}
+
+func (cp *CloudPricing) SetCachePrice(region Region, engine Engine, instanceType InstanceType, price float64) {
+	byRegion, ok := cp.ManagedCache[region]
+	if !ok {
+		byRegion = map[Engine]map[InstanceType]*InstancePricing{}
+		cp.ManagedCache[region] = byRegion
+	}
+	byEngine := byRegion[engine]
+	if byEngine == nil {
+		byEngine = map[InstanceType]*InstancePricing{}
+		byRegion[engine] = map[InstanceType]*InstancePricing{}
+	}
+	instance := byEngine[instanceType]
+	if instance == nil {
+		instance = &InstancePricing{}
+		byEngine[instanceType] = instance
+	}
+	instance.OnDemand = price
 }
 
 func (cp *CloudPricing) Stats() string {
@@ -178,7 +237,11 @@ func loadModel(dbFile string) (*Model, error) {
 		if row.region == "" {
 			continue
 		}
-		if row.service != "AmazonEC2" && row.service != "Compute Engine" && row.service != "Virtual Machines" {
+		switch row.service {
+		case "AmazonEC2", "AmazonRDS", "AmazonElastiCache":
+		case "Compute Engine":
+		case "Virtual Machines":
+		default:
 			continue
 		}
 		if err = json.Unmarshal([]byte(rec[6]), &row.attrs); err != nil {
@@ -201,29 +264,97 @@ func loadModel(dbFile string) (*Model, error) {
 
 func aws(r *pricingRow, pricing *CloudPricing) {
 	instanceType := InstanceType(r.attrs["instanceType"])
-	if instanceType == "" || r.attrs["operatingSystem"] != "Linux" || r.attrs["preInstalledSw"] != "NA" {
+	if instanceType == "" {
 		return
 	}
-	for _, v := range r.pricing {
-		for _, m := range v {
-			if m["unit"] != "Hrs" {
-				continue
+	switch r.service {
+	case "AmazonEC2":
+		if r.attrs["operatingSystem"] != "Linux" || r.attrs["preInstalledSw"] != "NA" {
+			return
+		}
+		for _, v := range r.pricing {
+			for _, m := range v {
+				if m["unit"] != "Hrs" {
+					continue
+				}
+				var po PurchaseOption
+				switch m["purchaseOption"] {
+				case "on_demand":
+					po = OnDemand
+				case "spot":
+					po = Spot
+				default:
+					continue
+				}
+				p, _ := m["USD"]
+				price, _ := strconv.ParseFloat(p, 64)
+				if price == 0 {
+					continue
+				}
+				pricing.SetPrice(Region(r.region), instanceType, po, price)
 			}
-			var po PurchaseOption
-			switch m["purchaseOption"] {
-			case "on_demand":
-				po = OnDemand
-			case "spot":
-				po = Spot
-			default:
-				continue
+		}
+	case "AmazonRDS":
+		var engine Engine
+		switch r.attrs["databaseEngine"] {
+		case "Aurora MySQL":
+			engine = "aurora-mysql"
+		case "MySQL":
+			engine = "mysql"
+		case "Aurora PostgreSQL":
+			engine = "aurora-postgresql"
+		case "PostgreSQL":
+			engine = "postgres"
+		default:
+			return
+		}
+		var do DBDeploymentOption
+		switch r.attrs["deploymentOption"] {
+		case "Single-AZ":
+			do = SingleAz
+		case "Multi-AZ":
+			do = MultiAz
+		default:
+			return
+		}
+		for _, v := range r.pricing {
+			for _, m := range v {
+				if m["unit"] != "Hrs" || m["purchaseOption"] != "on_demand" {
+					continue
+				}
+				p, _ := m["USD"]
+				price, _ := strconv.ParseFloat(p, 64)
+				if price == 0 {
+					continue
+				}
+				pricing.SetDBPrice(Region(r.region), Engine(engine), instanceType, do, price)
 			}
-			p, _ := m["USD"]
-			price, _ := strconv.ParseFloat(p, 64)
-			if price == 0 {
-				continue
+		}
+	case "AmazonElastiCache":
+		var engine Engine
+		switch r.attrs["cacheEngine"] {
+		case "Memcached":
+			engine = "memcached"
+		case "Redis":
+			engine = "redis"
+		default:
+			return
+		}
+		if r.attrs["locationType"] != "AWS Region" {
+			return
+		}
+		for _, v := range r.pricing {
+			for _, m := range v {
+				if m["unit"] != "Hrs" || m["purchaseOption"] != "on_demand" {
+					continue
+				}
+				p, _ := m["USD"]
+				price, _ := strconv.ParseFloat(p, 64)
+				if price == 0 {
+					continue
+				}
+				pricing.SetCachePrice(Region(r.region), Engine(engine), instanceType, price)
 			}
-			pricing.SetPrice(Region(r.region), instanceType, po, price)
 		}
 	}
 }
