@@ -45,21 +45,35 @@ type DBInstancePricing struct {
 	MultiAz  *InstancePricing `json:"multi_az"`
 }
 
+type StartUsageAmountGB int64
+
+type DataTransferPricing struct {
+	IngressPerGB float64 `json:"ingress_per_gb"`
+	EgressPerGB  float64 `json:"egress_per_gb"`
+}
+
 type CloudPricing struct {
-	Compute      map[Region]map[InstanceType]*InstancePricing              `json:"compute"`
-	ManagedDB    map[Region]map[Engine]map[InstanceType]*DBInstancePricing `json:"managed_db"`
-	ManagedCache map[Region]map[Engine]map[InstanceType]*InstancePricing   `json:"managed_cache"`
+	Compute                 map[Region]map[InstanceType]*InstancePricing              `json:"compute"`
+	ManagedDB               map[Region]map[Engine]map[InstanceType]*DBInstancePricing `json:"managed_db"`
+	ManagedCache            map[Region]map[Engine]map[InstanceType]*InstancePricing   `json:"managed_cache"`
+	InternetEgress          map[Region]map[StartUsageAmountGB]float64                 `json:"internet_egress"`
+	IntraRegionDataTransfer map[Region]DataTransferPricing                            `json:"inter_region_data_transfer"`
 }
 
 func NewCloudPricing() *CloudPricing {
 	return &CloudPricing{
-		Compute:      map[Region]map[InstanceType]*InstancePricing{},
-		ManagedDB:    map[Region]map[Engine]map[InstanceType]*DBInstancePricing{},
-		ManagedCache: map[Region]map[Engine]map[InstanceType]*InstancePricing{},
+		Compute:                 map[Region]map[InstanceType]*InstancePricing{},
+		ManagedDB:               map[Region]map[Engine]map[InstanceType]*DBInstancePricing{},
+		ManagedCache:            map[Region]map[Engine]map[InstanceType]*InstancePricing{},
+		InternetEgress:          map[Region]map[StartUsageAmountGB]float64{},
+		IntraRegionDataTransfer: map[Region]DataTransferPricing{},
 	}
 }
 
 func (cp *CloudPricing) SetPrice(region Region, instanceType InstanceType, po PurchaseOption, price float64) {
+	if region == "" {
+		return
+	}
 	byRegion, ok := cp.Compute[region]
 	if !ok {
 		byRegion = map[InstanceType]*InstancePricing{}
@@ -78,7 +92,42 @@ func (cp *CloudPricing) SetPrice(region Region, instanceType InstanceType, po Pu
 	}
 }
 
+func (cp *CloudPricing) SetIntraRegionDataTransferPrice(region Region, ingress, egress float64) {
+	if region == "" {
+		return
+	}
+	cp.IntraRegionDataTransfer[region] = DataTransferPricing{IngressPerGB: ingress, EgressPerGB: egress}
+}
+
+func (cp *CloudPricing) SetInternetEgress(region Region, pricing map[string][]map[string]string, unit string) {
+	if region == "" {
+		return
+	}
+	res := map[StartUsageAmountGB]float64{}
+	for _, v := range pricing {
+		for _, m := range v {
+			if m["unit"] != unit {
+				continue
+			}
+			s := m["USD"]
+			if s == "" {
+				continue
+			}
+			if p, _ := strconv.ParseFloat(s, 32); p > 0 {
+				startUsageAmount, _ := strconv.ParseInt(m["startUsageAmount"], 10, 64)
+				res[StartUsageAmountGB(startUsageAmount)] = p
+			}
+		}
+	}
+	if len(res) > 0 {
+		cp.InternetEgress[region] = res
+	}
+}
+
 func (cp *CloudPricing) SetDBPrice(region Region, engine Engine, instanceType InstanceType, do DBDeploymentOption, price float64) {
+	if region == "" {
+		return
+	}
 	byRegion, ok := cp.ManagedDB[region]
 	if !ok {
 		byRegion = map[Engine]map[InstanceType]*DBInstancePricing{}
@@ -106,6 +155,9 @@ func (cp *CloudPricing) SetDBPrice(region Region, engine Engine, instanceType In
 }
 
 func (cp *CloudPricing) SetCachePrice(region Region, engine Engine, instanceType InstanceType, price float64) {
+	if region == "" {
+		return
+	}
 	byRegion, ok := cp.ManagedCache[region]
 	if !ok {
 		byRegion = map[Engine]map[InstanceType]*InstancePricing{}
@@ -170,7 +222,7 @@ func main() {
 
 type pricingRow struct {
 	vendor        string
-	region        string
+	region        Region
 	service       string
 	productFamily string
 	attrs         map[string]string
@@ -230,17 +282,14 @@ func loadModel(dbFile string) (*Model, error) {
 		}
 		row := &pricingRow{
 			vendor:        rec[2],
-			region:        rec[3],
+			region:        Region(rec[3]),
 			service:       rec[4],
 			productFamily: rec[5],
 		}
-		if row.region == "" {
-			continue
-		}
 		switch row.service {
-		case "AmazonEC2", "AmazonRDS", "AmazonElastiCache":
+		case "AmazonEC2", "AmazonRDS", "AmazonElastiCache", "AWSDataTransfer":
 		case "Compute Engine":
-		case "Virtual Machines":
+		case "Virtual Machines", "Bandwidth":
 		default:
 			continue
 		}
@@ -259,16 +308,34 @@ func loadModel(dbFile string) (*Model, error) {
 			azure(row, model.Azure)
 		}
 	}
+	for region := range model.AWS.Compute {
+		model.AWS.SetIntraRegionDataTransferPrice(region, 0.01, 0.01)
+	}
+	for region := range model.GCP.Compute {
+		model.GCP.SetIntraRegionDataTransferPrice(region, 0, 0.01)
+	}
+	for region := range model.Azure.Compute {
+		model.Azure.SetIntraRegionDataTransferPrice(region, 0, 0.)
+	}
 	return model, nil
 }
 
 func aws(r *pricingRow, pricing *CloudPricing) {
 	instanceType := InstanceType(r.attrs["instanceType"])
-	if instanceType == "" {
-		return
-	}
 	switch r.service {
+	case "AWSDataTransfer":
+		fromRegion := Region(r.attrs["fromRegionCode"])
+		switch r.attrs["transferType"] {
+		case "AWS Outbound":
+			if r.attrs["fromLocationType"] != "AWS Region" {
+				return
+			}
+			pricing.SetInternetEgress(fromRegion, r.pricing, "GB")
+		}
 	case "AmazonEC2":
+		if instanceType == "" {
+			return
+		}
 		if r.attrs["operatingSystem"] != "Linux" || r.attrs["preInstalledSw"] != "NA" {
 			return
 		}
@@ -291,10 +358,13 @@ func aws(r *pricingRow, pricing *CloudPricing) {
 				if price == 0 {
 					continue
 				}
-				pricing.SetPrice(Region(r.region), instanceType, po, price)
+				pricing.SetPrice(r.region, instanceType, po, price)
 			}
 		}
 	case "AmazonRDS":
+		if instanceType == "" {
+			return
+		}
 		var engine Engine
 		switch r.attrs["databaseEngine"] {
 		case "Aurora MySQL":
@@ -327,10 +397,13 @@ func aws(r *pricingRow, pricing *CloudPricing) {
 				if price == 0 {
 					continue
 				}
-				pricing.SetDBPrice(Region(r.region), Engine(engine), instanceType, do, price)
+				pricing.SetDBPrice(r.region, engine, instanceType, do, price)
 			}
 		}
 	case "AmazonElastiCache":
+		if instanceType == "" {
+			return
+		}
 		var engine Engine
 		switch r.attrs["cacheEngine"] {
 		case "Memcached":
@@ -353,72 +426,84 @@ func aws(r *pricingRow, pricing *CloudPricing) {
 				if price == 0 {
 					continue
 				}
-				pricing.SetCachePrice(Region(r.region), Engine(engine), instanceType, price)
+				pricing.SetCachePrice(r.region, engine, instanceType, price)
 			}
 		}
 	}
 }
 
 func gcp(r *pricingRow, pricing *CloudPricing) {
-	if r.productFamily != "Compute Instance" {
-		return
-	}
-	instanceType := InstanceType(r.attrs["machineType"])
-	if instanceType == "" {
-		return
-	}
-	for _, v := range r.pricing {
-		for _, m := range v {
-			if m["unit"] != "Hours" {
-				continue
+	switch r.productFamily {
+	case "Network":
+		switch r.attrs["resourceGroup"] {
+		case "StandardInternetEgress":
+			pricing.SetInternetEgress(r.region, r.pricing, "gibibyte")
+		}
+	case "Compute Instance":
+		instanceType := InstanceType(r.attrs["machineType"])
+		if instanceType == "" {
+			return
+		}
+		for _, v := range r.pricing {
+			for _, m := range v {
+				if m["unit"] != "Hours" {
+					continue
+				}
+				var po PurchaseOption
+				switch m["purchaseOption"] {
+				case "on_demand":
+					po = OnDemand
+				case "preemptible":
+					po = Spot
+				default:
+					continue
+				}
+				p, _ := m["USD"]
+				price, _ := strconv.ParseFloat(p, 64)
+				if price == 0 {
+					continue
+				}
+				pricing.SetPrice(Region(r.region), instanceType, po, price)
 			}
-			var po PurchaseOption
-			switch m["purchaseOption"] {
-			case "on_demand":
-				po = OnDemand
-			case "preemptible":
-				po = Spot
-			default:
-				continue
-			}
-			p, _ := m["USD"]
-			price, _ := strconv.ParseFloat(p, 64)
-			if price == 0 {
-				continue
-			}
-			pricing.SetPrice(Region(r.region), instanceType, po, price)
 		}
 	}
 }
 
 func azure(r *pricingRow, pricing *CloudPricing) {
-	if r.productFamily != "Compute" {
+	if r.region == "" {
 		return
 	}
-	instanceType := InstanceType(r.attrs["armSkuName"])
-	if instanceType == "" {
-		return
-	}
-	for _, v := range r.pricing {
-		for _, m := range v {
-			if m["unit"] != "1 Hour" {
-				continue
+	switch r.productFamily {
+	case "Networking":
+		if r.attrs["productName"] == "Bandwidth - Routing Preference: Internet" {
+			pricing.SetInternetEgress(r.region, r.pricing, "1 GB")
+		}
+	case "Compute":
+		instanceType := InstanceType(r.attrs["armSkuName"])
+		if instanceType == "" {
+			return
+		}
+		for _, v := range r.pricing {
+			for _, m := range v {
+				if m["unit"] != "1 Hour" {
+					continue
+				}
+				var po PurchaseOption
+				switch m["purchaseOption"] {
+				case "Consumption":
+					po = OnDemand
+				case "Spot":
+					po = Spot
+				default:
+					continue
+				}
+				p, _ := m["USD"]
+				price, _ := strconv.ParseFloat(p, 64)
+				if price == 0 {
+					continue
+				}
+				pricing.SetPrice(Region(r.region), instanceType, po, price)
 			}
-			var po PurchaseOption
-			switch m["purchaseOption"] {
-			case "Consumption":
-				po = OnDemand
-			case "Spot":
-				po = Spot
-			default:
-				continue
-			}
-			p, _ := m["USD"]
-			price, _ := strconv.ParseFloat(p, 64)
-			if price == 0 {
-				continue
-			}
-			pricing.SetPrice(Region(r.region), instanceType, po, price)
 		}
 	}
 }
